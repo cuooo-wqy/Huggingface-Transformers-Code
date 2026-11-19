@@ -1,0 +1,126 @@
+from transformers import AutoTokenizer,AutoModelForSequenceClassification
+import pandas as pd
+#1.创建Dataset
+from torch.utils.data import Dataset
+class MyDataset(Dataset):
+    def __init__(self)->None:
+        super().__init__()
+        self.data=pd.read_csv("ChnSentiCorp_htl_all.csv")
+        self.data=self.data.dropna()
+
+    def __getitem__(self, index):
+        return self.data.iloc[index]["review"],self.data.iloc[index]["label"]
+
+    def __len__(self):
+        return len(self.data)
+
+dataset=MyDataset()
+#2.划分数据集
+from torch.utils.data import random_split
+trainset,vaildset = random_split(dataset,lengths=[0.9,0.1])
+
+#3.创建Dataloader
+import torch
+tokenizer=AutoTokenizer.from_pretrained("hfl/rbt3")
+#collate_func():把一个 batch 的多个样本拼成一个 batch 张量
+def collate_func(batch):
+    texts,labels=[],[]
+    for item in batch:
+        texts.append(item[0])
+        labels.append(item[1])
+    #tokenizer返回BatchEncoding对象（input_ids,attention_mask,token_type_ids),要转成pytorch张量
+    inputs=tokenizer(texts,max_length=128,padding="max_length",truncation=True,return_tensors="pt")
+    inputs["labels"]=torch.tensor(labels)
+    return inputs
+from torch.utils.data import DataLoader
+trainloader=DataLoader(dataset=trainset,batch_size=32,shuffle=True,collate_fn=collate_func)
+validloader=DataLoader(dataset=vaildset,batch_size=64,shuffle=False,collate_fn=collate_func)
+
+#4.创建模型以及优化器
+from torch.optim import Adam
+model=AutoModelForSequenceClassification.from_pretrained("hfl/rbt3")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = model.to(device)
+optimizer=Adam(model.parameters(),lr=2e-5)
+
+#5.训练与验证
+def evaluate():
+    model.eval()#关闭 Dropout、固定 BatchNorm 的统计量
+    acc_num=0
+    with torch.inference_mode():#关闭自动求导
+        for batch in validloader:
+            if torch.cuda.is_available():
+                batch={k:v.cuda() for k,v in batch.items()}
+            output=model(**batch)#字典解包
+            pred=torch.argmax(output.logits,dim=-1)#argmax(dim=-1) 是对每一行，在列方向上找最大值，返回下标
+            acc_num +=(pred.long()==batch["labels"].long()).float().sum()
+    return acc_num/len(vaildset)
+#epoch=3是重复算3轮，每轮都跑完所有训练集，每跑完100个batch就打印一次
+def train(epoch=3,log_step=100):
+    global_step=0
+    for ep in range(epoch):
+        model.train()
+        for batch in trainloader:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            batch={k:v.to(device) for k,v in batch.items()}
+            optimizer.zero_grad()
+            output=model(**batch)
+            output.loss.backward()
+            optimizer.step()
+            if global_step %log_step==0:
+                print(f"ep:{ep},global_step:{global_step},loss:{output.loss.item()}")
+            global_step +=1
+
+        acc=evaluate()
+        print(f"ep:{ep},acc:{acc}")
+
+#6.模型训练
+train()
+'''
+# 训练后保存
+model.save_pretrained("./my_rbt3_model")
+tokenizer.save_pretrained("./my_rbt3_model")
+
+# 以后独立预测时加载
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+model = AutoModelForSequenceClassification.from_pretrained("./my_rbt3_model")
+tokenizer = AutoTokenizer.from_pretrained("./my_rbt3_model")
+'''
+#7.模型预测
+sen="我觉得这家酒店不错，饭很好吃！"
+id2_label={0:"差评",1:"好评"}
+model.eval()
+with torch.inference_mode():
+    inputs=tokenizer(sen,return_tensors="pt")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    logits=model(**inputs).logits
+    pred=torch.argmax(logits,dim=-1)
+    print(f"输入：{sen}\n模型预测结果：{id2_label.get(pred.item())}")
+
+#和手写的预测流程等价
+from transformers import pipeline
+model.config.id2label=id2_label
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+pipe=pipeline("text-classification",model=model,tokenizer=tokenizer,device=device)
+pipe(sen)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
